@@ -1,26 +1,27 @@
 # Relentless: Unbreakable Workflows for Real-World Robotics
 
-[![Zenoh 0.8+](https://img.shields.io/badge/zenoh-0.8+-orange)](https://zenoh.io/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Zenoh 0.8+](https://img.shields.io/badge/zenoh-0.8+-orange.svg)](https://zenoh.io/)
 
 **Robots fail. Relentless workflows don't.**
 
-Relentless is a Python framework for building robust, fault-tolerant workflows that thrive in the chaos of real-world robotics. It provides battle-tested tools for handling inevitable failures, so your robots keep working even when things go wrong.
+Relentless is a Python framework for building robust, fault-tolerant workflows that thrive in the chaos of real-world robotics. It provides a powerful and intuitive way to handle inevitable failures, so your robots keep working even when things go wrong.
 
 ## Why Your Robots Need Relentless
+
 *   **They drop things.**
 *   **Their sensors lie.**
 *   **Networks are flaky.**
 *   **The unexpected happens.**
 
-Traditional workflow systems crumble under these pressures. Relentless is built for the challenge.
+Traditional workflow systems crumble under these pressures. Relentless was built for the challenge.
 
-## Key Features That Keep You in Production
+## Key Features
 
-*   **Compensation Chains:** Define how to undo actions when (not if) steps fail.
+*   **Actionable Compensation:** Define how to undo actions or mitigate their effects when steps fail.
 *   **Smart Retries:** Configurable backoff strategies (linear, exponential, Fibonacci) with jitter.
 *   **Time-Aware:** Wall-clock timeouts, sensor-based triggers, and time-bound compensation.
-*   **Stateful Execution:** Transparent persistence on Zenoh-KV with versioned updates.
+*   **Stateful Execution:** Leverages Zenoh's built-in persistence for transparent, versioned state management.
 *   **Partial Rollbacks:** Undo only what's needed, not the entire workflow.
 *   **Human-in-the-Loop:** Escalate to operators when automation hits its limits.
 *   **Distributed Coordination:** Built on Zenoh for seamless multi-robot orchestration.
@@ -36,25 +37,32 @@ pip install relentless-flow
 *   Python 3.10+
 
 ## Core Concepts
+Relentless is built on a formal mathematical model that ensures predictable behavior and robust error recovery. This model is reflected in the Python API through the following concepts:
+
 ### 1. Workflows
-A sequence of steps with defined success and failure paths:
+A `Workflow` is a sequence of `Steps` with defined success and failure paths. Each `Workflow` defines a `Compensation Strategy` to be used in case of failure during workflow execution.
 
 ```python
-from relentless import workflow
+from relentless import workflow, Workflow, CompensateReverse, CompensateAction
 
 @workflow
-async def pick_and_place(item_id: str):
-    await move_to_bin(item_id).retry(3)
-    await grasp(item_id).compensate(release())
-    await move_to_conveyor(item_id)
-    await release()
+class PickAndPlace(Workflow):
+    compensation_strategy = CompensateReverse()
+
+    def build(self):
+      return [
+          MoveTo("bin"),
+          Grasp(),
+          MoveTo("conveyor"),
+          Release()
+      ]
 ```
 
 ### 2. Steps
-Individual actions with optional retries, timeouts, and compensation:
+A `Step` is an individual, potentially reversible, action within a `Workflow`. Each `Step` defines how it is executed (`.run()`) as well as how it is compensated (`.compensate()`). Each `Step` can define its own `RetryPolicy` and `TimeoutPolicy`.
 
 ```python
-from relentless import Step, RetryPolicy, Compensation
+from relentless import Step, RetryPolicy, TimeoutPolicy, Compensation, WorkflowContext
 
 class MoveTo(Step):
     def __init__(self, destination: str):
@@ -63,196 +71,236 @@ class MoveTo(Step):
             retry_policy=RetryPolicy(
                 max_attempts=5,
                 backoff="exponential"
+            ),
+            timeout_policy=TimeoutPolicy(
+                timeout=timedelta(seconds=5)
             )
         )
+        self.destination = destination
 
-    async def run(self, context):
+    async def run(self, context: WorkflowContext):
         await context.zenoh.put(
-            f"/robot/{context.robot_id}/arm/target",
-            destination.encode()
+            f"/robot/{context.workflow_id}/arm/target",
+            self.destination.encode()
         )
 
-    async def compensate(self, context):
+    async def compensate(self, context: WorkflowContext):
         await context.zenoh.put(
-            f"/robot/{context.robot_id}/arm/home",
+            f"/robot/{context.workflow_id}/arm/home",
             b''  # Empty payload triggers default "home" action
         )
 
 class Grasp(Step):
     def __init__(self):
-        super().__init__(name="grasp")
-
-    async def run(self, context):
-        result = await context.zenoh.get(
-            f"/robot/{context.robot_id}/gripper/close",
-            timeout=2.0
+        super().__init__(
+            name="grasp",
+            retry_policy=RetryPolicy(
+                max_attempts=3
+            ),
+            timeout_policy=TimeoutPolicy(
+                timeout=timedelta(seconds=2)
+            )
         )
-        if not result.success:
+
+    async def run(self, context: WorkflowContext):
+        result = await context.zenoh.get(
+            f"/robot/{context.workflow_id}/gripper/close"
+        )
+        if not result:
             raise GripperError("Failed to close gripper")
         
-    async def compensate(self, context):
+    async def compensate(self, context: WorkflowContext):
         await context.zenoh.put(
-            f"/robot/{context.robot_id}/gripper/open",
+            f"/robot/{context.workflow_id}/gripper/open",
             b''
         )
 ```
 
-### 3. Compensation Strategies
-Define *how* to recover from failures:
+### 3. Compensation
+Each `Step` can define a compensation action using `Compensation` or a `CompensateAction`, which is executed if the `Step` fails or if a later `Step` in the `Workflow` fails. `Compensation` can be defined as either `CompensateReverse`, which executes the `.compensate()` method of each `Step` in reverse order, `CompensateAction`, which defines a custom compensation action, or a custom `Compensation` strategy.
 
 ```python
-from relentless import (
-    ReverseOrderStrategy, 
-    DependencyAwareStrategy,
-    PhysicalMitigationStrategy,
-    LayeredStrategy
-)
+from relentless import Step, Compensation, CompensateAction, WorkflowContext
 
-# Default: undo steps in reverse order
-pick_workflow = Workflow(
-    steps=[MoveTo("bin"), Grasp(), MoveTo("conveyor")],
-    compensation_strategy=ReverseOrderStrategy()
-)
+class LogCompensation(CompensateAction):
+  def __init__(self, message: str):
+    super().__init__(name='log_compensation')
+    self.message = message
+      
+  async def compensate(self, context: WorkflowContext):
+      await context.zenoh.put(
+          f"/logs/{context.workflow_id}",
+          self.message
+      )
 
-# For complex dependencies:
-assembly_workflow = Workflow(
-    # ... steps with intricate dependencies
-    compensation_strategy=DependencyAwareStrategy(
-        dependency_graph=my_dependency_graph
-    )
-)
+class LogStep(Step):
+    def __init__(self, log_message: str):
+        super().__init__(
+            name="log_step",
+            compensation=LogCompensation(message=log_message)
+        )
 
-# When things really break:
-emergency_workflow = Workflow(
-    steps=[MoveArm(), Weld(), Inspect()],
-    compensation_strategy=LayeredStrategy([
-        PhysicalMitigationStrategy(
-            actions=[
-                lambda ctx: ctx.zenoh.put("/safety/stop_all", b''),
-                lambda ctx: ctx.zenoh.put("/alarm/siren", b'on')
-            ]
-        ),
-        ReverseOrderStrategy()  # Try reversing after mitigation
-    ])
-)
+    async def run(self, context: WorkflowContext):
+        await context.zenoh.put(
+            f"/logs/{context.workflow_id}",
+            "Log step executed successfully"
+        )
 ```
 
 ## Real-World Example: Bin Picking with Failure Recovery
 ```python
-from relentless import workflow, retry, compensate, atomic, WorkflowExecutor
+from relentless import (
+    workflow, Workflow, Step, CompensateReverse,
+    CompensateAction, WorkflowContext, WorkflowExecutor,
+    RetryPolicy, TimeoutPolicy, Atomic
+)
 from zenoh import Zenoh
 import numpy as np
 
-@workflow
-async def bin_picking(zenoh: Zenoh, bin_id: str):
-    """
-    1. Find part in bin using computer vision.
-    2. Attempt pick with force monitoring.
-    3. Verify grip using weight sensor.
-    4. Place part in container.
-    5. Handle heavy object detection (20kg+).
-    """
-    ARM_CMD = f"/arm/{bin_id}/target_pose"
-    GRIPPER_CMD = f"/gripper/{bin_id}/cmd"
-    FORCE_FEEDBACK = f"/sensors/{bin_id}/force"
-    VISION_CONF = f"/vision/{bin_id}/confidence"
+async def emergency_stop(zenoh: Zenoh):
+    await zenoh.put("/robot/emergency_stop", b'')
 
-    async with atomic("Grab part or abort"):
-        confidence = await zenoh.get(VISION_CONF, timeout=2.0)
-        if confidence < 0.7:
-            raise VisionError("Part not clearly visible")
+async def log_error(zenoh: Zenoh, message: str):
+    await zenoh.put(f"/errors/{context.workflow_id}", message)
 
-        target_pose = calculate_pose(confidence)
-        await zenoh.put(ARM_CMD, target_pose.tobytes()).retry(
-            strategy='fibonacci',
-            max_attempts=3,
-            on_failure=emergency_stop(zenoh)
-        ).compensate(
-            zenoh.put(ARM_CMD, SAFE_POSE.tobytes())
-            >> log_error(f"Failed move to {target_pose}")
-        )
-
-        grip_task = (
-            zenoh.put(GRIPPER_CMD, "close")
-            .timeout(1.5, "Gripper jammed")
-            .retry(2)
-            .with_force_check(
-                sensor=FORCE_FEEDBACK,
-                min=15.0,
-                max=45.0,
-                window=timedelta(seconds=2)
+class MoveTo(Step):
+    def __init__(self, destination: str):
+        super().__init__(
+            name=f"move_to_{destination}",
+            retry_policy=RetryPolicy(
+                max_attempts=5,
+                backoff="exponential"
+            ),
+            timeout_policy=TimeoutPolicy(
+                timeout=timedelta(seconds=5)
             )
         )
-        await grip_task.compensate(
-            zenoh.put(GRIPPER_CMD, "emergency_release")
-            >> zenoh.put("/alarms/gripper_fault", bin_id)
+        self.destination = destination
+
+    async def run(self, context: WorkflowContext):
+        await context.zenoh.put(
+            f"/arm/{context.workflow_id}/target_pose",
+            self.destination.tobytes()
         )
 
-    try:
-        weight = await zenoh.get("/load_cell/weight")
-        if weight > 20.0:
-            await zenoh.put(GRIPPER_CMD, "release")
-            raise HeavyObjectError(f"Object too heavy: {weight}kg")
+    async def compensate(self, context: WorkflowContext):
+        await context.zenoh.put(
+            f"/arm/{context.workflow_id}/target_pose",
+            SAFE_POSE.tobytes() # compensation is to move back to safe pose
+        )
 
-        await verify_grip(zenoh, bin_id).retry(2, backoff=1.0).timeout(3.0)
+class Grasp(Step):
+    def __init__(self, bin_id: str):
+        super().__init__(
+            name="grasp",
+            retry_policy=RetryPolicy(
+                max_attempts=3
+            ),
+            timeout_policy=TimeoutPolicy(
+                timeout=timedelta(seconds=2)
+            )
+        )
+        self.bin_id = bin_id
 
-    except (HeavyObjectError, VisionVerifyError):
-        await zenoh.put("/alarms/heavy_object", bin_id)
-        await log_to_mes("Heavy part detected - manual check")
-        raise
+    async def run(self, context: WorkflowContext):
+        await context.zenoh.put(f"/gripper/{self.bin_id}/cmd", "close")
+        
+    async def compensate(self, context: WorkflowContext):
+        await context.zenoh.put(f"/gripper/{self.bin_id}/cmd", "emergency_release")
 
-    place_pose = get_container_pose()
-    await zenoh.put(ARM_CMD, place_pose.tobytes()).retry(2)
-    await zenoh.put(GRIPPER_CMD, "release")
+@workflow
+class BinPicking(Workflow):
+    compensation_strategy = CompensateReverse()
+
+    def __init__(self, bin_id: str):
+        super().__init__(name=f"bin_picking_{bin_id}")
+        self.bin_id = bin_id
+
+    def build(self):
+        async def check_vision_confidence(context: WorkflowContext):
+            confidence = await context.zenoh.get(f"/vision/{self.bin_id}/confidence", timeout=2.0)
+            if confidence < 0.7:
+                raise VisionError("Part not clearly visible")
+
+        async def check_weight(context: WorkflowContext):
+            weight = await context.zenoh.get("/load_cell/weight")
+            if weight > 20.0:
+                await context.zenoh.put(f"/gripper/{self.bin_id}/cmd", "release")
+                raise HeavyObjectError(f"Object too heavy: {weight}kg")
+
+        return [
+            Atomic(
+                name="grab_part",
+                steps=[
+                    Step(name="check_vision", run=check_vision_confidence, retry_policy=RetryPolicy(max_attempts=1), compensation=CompensateAction(emergency_stop)),
+                    MoveTo(calculate_pose_from_vision(self.bin_id)),
+                    Grasp(self.bin_id)
+                ],
+                on_failure=emergency_stop(zenoh) # emergency stop if atomic fails
+            ),
+            Step(name="verify_grip", run=check_weight, retry_policy=RetryPolicy(attempts=2), timeout_policy=TimeoutPolicy(seconds=3)),
+            MoveTo(get_container_pose()),
+            Release(self.bin_id)
+        ]
 
 async def main():
     zenoh = await Zenoh.connect()
-    executor = WorkflowExecutor(
-        zenoh,
-        policy=ProductionPolicy(
-            max_retries=5,
-            human_escalation_timeout=300
-        )
-    )
+    executor = WorkflowExecutor(zenoh)
 
-    async with executor.monitor("/workflows/bin_picking/**") as live:
-        async for update in live:
-            if update.status == "COMPENSATING":
-                play_alert_sound()
-            post_to_mes(f"Bin {update.bin_id} | {update.current_step}")
-
-    async with TaskGroup() as tg:
-        for bin_id in ["cell1", "cell2", ..., "cell10"]:
-            tg.create_task(executor.run(bin_picking, zenoh, bin_id))
+    # Example of running the workflow
+    await executor.run(BinPicking("cell1"))
 
 ```
 
 ## Advanced Features
 ### 1. Timeouts
 ```python
-# Wall-clock timeout
-await do_something().timeout(seconds=5, on_timeout=handle_timeout)
+from relentless import TimeoutPolicy, WorkflowContext, Step
+from datetime import timedelta
 
-# Sensor-based timeout
-await grip_object().with_timeout(
-    condition=lambda ctx: ctx.zenoh.get("/force_sensor") > 50.0,
-    on_timeout=release_gripper
-)
+class Grasp(Step):
+    # ...
+    timeout_policy = TimeoutPolicy(
+        timeout=timedelta(seconds=2), # or specify a function: timeout=lambda context: context.workflow_config.grasp_timeout
+        on_timeout=emergency_stop  # Or define custom logic: on_timeout=lambda context: context.zenoh.put(...)
+    )
+    # ...
 ```
 
-### 2. Partial Compensation
+### 2. Atomic Blocks
+Atomic blocks use the defined `on_failure` action if any `Step` within the block fails. This does not prevent the normal compensation logic from executing.
+
 ```python
-async with atomic("Move and drill"):
-    await move_arm(target).compensate(move_arm(safe_pose))
-    await drill_hole().compensate(
-        fallback=lambda ctx: log_error("Failed to seal hole")
-    )
-    
-# Only move_arm compensation is executed if drill_hole fails
+from relentless import Atomic, Step, WorkflowContext
+
+async def release_and_alert(context: WorkflowContext):
+    await context.zenoh.put(f"/gripper/{context.workflow_id}/cmd", "release")
+    await context.zenoh.put(f"/alerts/{context.workflow_id}", "Heavy object detected")
+
+Atomic(
+    name="load_sensing",
+    steps=[
+      Step(name="check_weight", run=check_weight, retry_policy=RetryPolicy(attempts=2), timeout_policy=TimeoutPolicy(seconds=3))
+    ],
+    on_failure=release_and_alert
+)
 ```
 
 ### 3. Human Escalation
 ```python
+from relentless import Step, WorkflowContext
+
+class WaitForHuman(Step):
+    def __init__(self):
+        super().__init__(name="wait_for_human")
+
+    async def run(self, context: WorkflowContext):
+        while True:
+            response = await context.zenoh.get(f"/human/{context.workflow_id}/response")
+            if response and response.value.decode() == "OK":
+                break
+            await asyncio.sleep(5)
+
 @workflow
 async def critical_process():
     try:
@@ -263,38 +311,39 @@ async def critical_process():
             on_timeout=shutdown_system
         )
         # Wait for human to resolve
-        await wait_for_human_intervention()
-
-async def wait_for_human_intervention():
-    while True:
-        response = await zenoh.get("/operator/response")
-        if response == "OK":
-            break
-        await asyncio.sleep(10)
+        await WaitForHuman()
 ```
 
 ## Configuration
-```python
-from relentless import RelentlessConfig
+Relentless uses Zenoh's built-in persistence mechanisms. You can configure persistence using standard Zenoh router configuration files.
 
-config = RelentlessConfig(
-    default_retry_policy=RetryPolicy(
-        max_attempts=3,
-        backoff="fibonacci"
-    ),
-    compensation_storage_ttl="1h",  # Keep compensation data for 1 hour
-    safety_overrides={
-        "max_arm_speed": 0.5,  # m/s
-        "max_gripper_force": 50.0  # N
-    }
-)
-
-Relentless.set_global_config(config)
+**Example `config.json5`:**
+```json5
+{
+    mode: 'router',
+    plugins: {
+        rest: {
+            port: 8000
+        },
+        storage_manager: {
+            storages: {
+                workflow_state: {
+                    volume: {
+                        backend: 'rocksdb',
+                        path: '/tmp/zenoh-storage-workflow'
+                    }
+                }
+            }
+        }
+    },
+    // other config options
+}
 ```
+Refer to the [Zenoh documentation](https://zenoh.io/docs/getting-started/quick-start/) for more details on configuring Zenoh.
 
 ## Monitoring
 ```python
-async def monitor_workflows():
+async def monitor_workflows(zenoh: Zenoh):
     async with zenoh.subscribe("relentless/state/**") as stream:
         async for update in stream:
             state = WorkflowState.parse_raw(update.value)
