@@ -38,3 +38,27 @@ class SequenceFailed(Exception):
         if self.compensation_errors:
             msg += f" (compensation also failed: {self.compensation_errors})"
         super().__init__(msg)
+
+
+class ParallelFailed(Exception):
+    """Raised when a step inside a Parallel fails.
+
+    Attributes:
+        failed_step_name: Name of the step that failed.
+        original_error: The exception that caused the failure.
+        compensation_errors: Errors from compensating completed siblings.
+    """
+
+    def __init__(self, failed_step_name, original_error, compensation_errors=None):
+        self.failed_step_name = failed_step_name
+        self.original_error = original_error
+        self.compensation_errors = compensation_errors or []
+        self.compensated = len(self.compensation_errors) == 0
+        msg = f"Parallel step '{failed_step_name}' failed: {original_error}"
+        super().__init__(msg)
+
+
+class GuardFailed(Exception):
+    """Raised when a Guard condition is falsy and no otherwise step is set."""
+
+    pass

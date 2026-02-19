@@ -85,10 +85,23 @@ async def _(ctx: rel.Context, destination: str):
 Compensation is **declared, not inferred**. You always see exactly what
 will undo what.
 
+For safety-critical tasks, compensation can retry:
+
+```python
+@rel.task(retry=2, undo_retry=3)
+async def close_gripper(ctx):
+    await ctx.execute("gripper.close")
+
+@close_gripper.undo
+async def _(ctx):
+    # Will retry up to 3 times if undo fails (e.g. gripper stuck)
+    await ctx.execute("gripper.open")
+```
+
 ### Sequences
 
-A `Sequence` runs tasks in order. On failure, it compensates all
-completed tasks in reverse:
+A `Sequence` runs steps in order. On failure, it compensates all
+completed steps in reverse:
 
 ```python
 flow = rel.Sequence([
@@ -103,6 +116,67 @@ Or use the `>>` operator:
 
 ```python
 flow = move_to("station_1") >> pick_up() >> move_to("station_2") >> place_down()
+```
+
+Sequences nest. A sequence used inside another sequence acts as a single
+step &mdash; if the outer sequence fails later, the inner sequence
+compensates all its sub-steps:
+
+```python
+pick_phase = rel.Sequence([scan_bin(), pick_object()], name="pick")
+place_phase = rel.Sequence([move_to("drop"), release()], name="place")
+full_flow = rel.Sequence([pick_phase, place_phase])
+```
+
+### Parallel
+
+Run steps concurrently. If any step fails, completed siblings are
+compensated:
+
+```python
+flow = rel.Sequence([
+    rel.Parallel([
+        move_arm("left", "hold_position"),
+        move_arm("right", "approach"),
+    ], name="position_arms"),
+    close_gripper("left"),
+    insert_bolt(),
+])
+```
+
+### Branching
+
+Route execution based on runtime data:
+
+```python
+flow = rel.Sequence([
+    classify_defect(),
+    rel.Branch(
+        lambda ctx: ctx.state["defect_type"],
+        {
+            "none":       route_to_packaging(),
+            "cosmetic":   route_to_rework(),
+            "structural": route_to_reject(),
+        },
+        default=stop_and_call_operator(),
+        name="route_part",
+    ),
+])
+```
+
+### Guards
+
+Run a step only if a precondition holds:
+
+```python
+flow = rel.Sequence([
+    read_force_sensor(),
+    rel.Guard(
+        lambda ctx: ctx.state["force"] < 5.0,
+        insert_peg(),
+        otherwise=abort_insertion(),
+    ),
+])
 ```
 
 ### Retry Policies
@@ -123,7 +197,7 @@ Backoff strategies: `"none"`, `"linear"`, `"exponential"`, `"fibonacci"`.
 ### Adapters
 
 Adapters bridge tasks to the outside world. Relentless is
-transport-agnostic&mdash;use whatever fits your system.
+transport-agnostic &mdash; use whatever fits your system.
 
 **LocalAdapter** for testing (no external dependencies):
 
@@ -151,6 +225,21 @@ class MyROS2Adapter:
     async def read(self, key: str):
         # Read from ROS2 topics
         ...
+```
+
+### Lifecycle Hooks
+
+Monitor execution in production:
+
+```python
+hooks = rel.Hooks(
+    on_step_start=lambda name, ctx: print(f"Starting {name}"),
+    on_step_end=lambda name, ctx: metrics.increment(f"step.{name}.ok"),
+    on_step_error=lambda name, ctx, err: logger.error(f"{name}: {err}"),
+    on_compensate=lambda name, ctx: logger.warning(f"Compensating {name}"),
+)
+
+result = await flow.run(adapter, hooks=hooks)
 ```
 
 ### Shared State
@@ -184,74 +273,24 @@ except rel.SequenceFailed as e:
     print(f"All compensations succeeded: {e.compensated}")
 ```
 
-## Real-World Example: Bin Picking
+## Known Limitations
 
-```python
-import relentless as rel
-from relentless.adapters import LocalAdapter
+Relentless is a task sequencer, not a complete robotics framework.
+These are real gaps, documented honestly:
 
-SAFE_HOME = "safe_home"
+| Gap | Workaround | Status |
+|:----|:-----------|:-------|
+| No loops / iteration | Build sequences dynamically with Python `for` | By design |
+| No cancellation | `asyncio.Task.cancel()` (no compensation) | Planned |
+| No sequence-level timeout | Wrap with `asyncio.wait_for()` | Planned |
+| No persistence / crash recovery | External journal | Planned |
+| No partial success | Run items individually, collect results | Planned |
+| No resource locking | Use `asyncio.Lock` inside task bodies | External |
+| No error discrimination | Catch specific exceptions in task bodies | Planned |
+| No sensor streaming | Out of scope (use motion controllers) | By design |
+| `ctx.state` is untyped | Use descriptive keys, or dataclasses | Accepted |
 
-@rel.task(retry=3, backoff="exponential", timeout=5.0)
-async def move_to(ctx: rel.Context, destination: str):
-    await ctx.execute("arm.move", destination)
-
-@move_to.undo
-async def _(ctx: rel.Context, destination: str):
-    await ctx.execute("arm.move", SAFE_HOME)
-
-@rel.task(retry=1)
-async def check_vision(ctx: rel.Context, bin_id: str):
-    confidence = await ctx.execute("vision.detect", bin_id)
-    if confidence is not None and confidence < 0.7:
-        raise rel.TaskFailed("Part not clearly visible")
-    ctx.state["target_pose"] = await ctx.execute("vision.pose", bin_id)
-
-@rel.task(retry=2, timeout=2.0)
-async def grasp(ctx: rel.Context):
-    result = await ctx.execute("gripper.close")
-    if result is False:
-        raise rel.TaskFailed("Grip failed")
-
-@grasp.undo
-async def _(ctx: rel.Context):
-    await ctx.execute("gripper.open")
-
-@rel.task
-async def verify_weight(ctx: rel.Context):
-    weight = await ctx.execute("loadcell.read")
-    if weight is not None and weight > 20.0:
-        await ctx.execute("gripper.open")
-        raise rel.TaskFailed(f"Object too heavy: {weight}kg")
-
-@rel.task
-async def release(ctx: rel.Context):
-    await ctx.execute("gripper.open")
-
-# Compose the full workflow
-bin_pick = rel.Sequence([
-    check_vision("cell_1"),
-    move_to("bin_pose"),
-    grasp(),
-    verify_weight(),
-    move_to("conveyor"),
-    release(),
-])
-
-# Test it without any hardware
-async def main():
-    adapter = LocalAdapter()
-    adapter.on("arm.move", lambda dest: True)
-    adapter.on("vision.detect", lambda bin_id: 0.95)
-    adapter.on("vision.pose", lambda bin_id: [0.5, 0.3, 0.1])
-    adapter.on("gripper.close", lambda: True)
-    adapter.on("gripper.open", lambda: True)
-    adapter.on("loadcell.read", lambda: 5.0)
-
-    result = await bin_pick.run(adapter)
-    assert result.success
-    print(f"Completed {result.tasks_completed} tasks")
-```
+See `examples/` for realistic scenarios that exercise these boundaries.
 
 ## Design Principles
 
@@ -261,7 +300,7 @@ async def main():
    are optional.
 3. **Testable by default.** Every workflow runs with `LocalAdapter()`,
    no hardware or network needed.
-4. **Transport-agnostic.** Zenoh, ROS2, MQTT, direct calls&mdash;plug
+4. **Transport-agnostic.** Zenoh, ROS2, MQTT, direct calls &mdash; plug
    in what you use.
 5. **Explicit over magic.** Compensation is declared, not inferred.
 

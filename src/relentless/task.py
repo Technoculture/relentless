@@ -24,12 +24,14 @@ class Task:
         retry_policy: RetryPolicy = DEFAULT_RETRY,
         timeout: float | None = None,
         name: str | None = None,
+        undo_retry: int = 1,
     ):
         self.fn = fn
         self.undo_fn: Callable | None = None
         self.retry_policy = retry_policy
         self.timeout = timeout
         self.name = name or fn.__name__
+        self.undo_retry = undo_retry
         functools.update_wrapper(self, fn)
 
     def __call__(self, *args: Any, **kwargs: Any) -> BoundTask:
@@ -89,9 +91,22 @@ class BoundTask:
         ) from last_error
 
     async def compensate(self, ctx: Context) -> None:
-        """Run compensation for this task, if registered."""
-        if self.task.undo_fn is not None:
-            await self.task.undo_fn(ctx, *self.args, **self.kwargs)
+        """Run compensation for this task, retrying if configured."""
+        if self.task.undo_fn is None:
+            return
+
+        last_error: Exception | None = None
+        for attempt in range(self.task.undo_retry):
+            try:
+                await self.task.undo_fn(ctx, *self.args, **self.kwargs)
+                return
+            except Exception as e:
+                last_error = e
+                if attempt < self.task.undo_retry - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+        # All undo attempts failed — re-raise the last error
+        raise last_error  # type: ignore[misc]
 
     def __rshift__(self, other: Any) -> Any:
         """Compose tasks with the ``>>`` operator."""
@@ -119,6 +134,7 @@ def task(
     jitter: bool = False,
     timeout: float | None = None,
     name: str | None = None,
+    undo_retry: int = 1,
 ) -> Task | Callable[..., Task]:
     """Decorator to create a Task from an async function.
 
@@ -131,6 +147,20 @@ def task(
         @task(retry=3, backoff="exponential", timeout=5.0)
         async def resilient(ctx):
             ...
+
+        @task(retry=2, undo_retry=3)
+        async def critical_with_reliable_undo(ctx):
+            ...
+
+    Args:
+        retry: Max execution attempts (1 = no retry).
+        backoff: Backoff strategy for retries.
+        base_delay: Base delay in seconds for backoff.
+        max_delay: Max delay cap in seconds.
+        jitter: Randomize retry delay by +/-50%.
+        timeout: Per-attempt timeout in seconds.
+        name: Override the task name (defaults to function name).
+        undo_retry: Max compensation attempts (1 = no retry).
     """
     retry_policy = RetryPolicy(
         max_attempts=retry,
@@ -141,7 +171,13 @@ def task(
     )
 
     def decorator(fn: Callable) -> Task:
-        return Task(fn, retry_policy=retry_policy, timeout=timeout, name=name)
+        return Task(
+            fn,
+            retry_policy=retry_policy,
+            timeout=timeout,
+            name=name,
+            undo_retry=undo_retry,
+        )
 
     if fn is not None:
         # Used as @task without arguments
