@@ -1,7 +1,7 @@
 # Design: Compensation Algebra for Task Sequences
 
 This document formalizes the compensation model behind Relentless and
-maps each mathematical concept to its implementation.
+maps each mathematical concept to its Rust implementation.
 
 ## The Problem
 
@@ -20,7 +20,7 @@ physical actions?**
 An **action** `a` is an async operation that changes the physical world:
 
 ```
-a : Context → Result
+a : Context → Result<()>
 ```
 
 A **compensation** `γ(a)` is an action that mitigates or reverses `a`:
@@ -34,14 +34,14 @@ For irreversible actions: `γ(a)` is the best available mitigation.
 
 **In code:**
 
-```python
-@rel.task
-async def grasp(ctx):          # action a
-    await ctx.execute("gripper.close")
-
-@grasp.undo
-async def _(ctx):              # compensation γ(a)
-    await ctx.execute("gripper.open")
+```rust
+let grasp = FnTask::new("grasp", |ctx| Box::pin(async move {
+    ctx.execute("gripper.close", &[]).await?;
+    Ok(())
+})).with_compensate(|ctx| Box::pin(async move {
+    ctx.execute("gripper.open", &[]).await?;
+    Ok(())
+}));
 ```
 
 ### Sequences and the Saga Pattern
@@ -70,9 +70,10 @@ excluded because it never completed.
 
 **In code:**
 
-```python
-flow = rel.Sequence([a1, a2, a3, a4])
-# If a3 fails: compensate a2, then a1
+```rust
+let flow = Sequence::new("assembly")
+    .step(a1).step(a2).step(a3).step(a4);
+// If a3 fails: compensate a2, then a1
 ```
 
 ### Retry as Bounded Repetition
@@ -95,10 +96,87 @@ With optional jitter: `d'(i) = d(i) × uniform(0.5, 1.5)`
 
 **In code:**
 
-```python
-@rel.task(retry=5, backoff="exponential", base_delay=0.5, jitter=True)
-async def flaky_sensor(ctx):
-    ...
+```rust
+let seq = Sequence::new("retrying")
+    .step(flaky_step)
+    .retry(RetryPolicy::exponential(5, Duration::from_millis(100)).with_jitter());
+```
+
+### Error Discrimination
+
+Not all failures require the same response. The **error strategy**
+function maps errors to behaviors:
+
+```
+σ : Error → {Compensate, Skip, Escalate}
+```
+
+- **Compensate**: undo completed steps in reverse (default)
+- **Skip**: ignore this failure, continue to next step
+- **Escalate**: stop immediately, do NOT compensate
+
+**In code:**
+
+```rust
+fn error_strategy(&self, error: &Error) -> ErrorStrategy {
+    match error {
+        Error::TaskFailed { message, .. } if message.contains("non-critical") => {
+            ErrorStrategy::Skip
+        }
+        _ => ErrorStrategy::Compensate,
+    }
+}
+```
+
+### Parallel Composition
+
+Actions `a₁, a₂, ..., aₙ` execute concurrently:
+
+```
+P(a₁, ..., aₙ) : all aᵢ run simultaneously
+```
+
+If any `aᵢ` fails, all completed siblings `aⱼ` (j ≠ i, succeeded) are
+compensated.
+
+**In code:**
+
+```rust
+let par = Parallel::new("both_arms")
+    .step(left_arm).step(right_arm);
+```
+
+### Conditional Execution
+
+A **guard** `G(p, a, f)` checks predicate `p`, runs action `a` if true,
+fallback `f` if false:
+
+```
+G(p, a, f) = if p(ctx) then a else f
+```
+
+A **branch** `B(s, [a₁, ..., aₙ])` selects one action based on
+selector `s`:
+
+```
+B(s, branches) = branches[s(ctx)]
+```
+
+### Iteration
+
+A **loop** `L(p, a, n)` repeats action `a` while predicate `p` holds,
+bounded by maximum iterations `n`:
+
+```
+L(p, a, n) = while p(ctx) ∧ count < n: execute(a)
+```
+
+**In code:**
+
+```rust
+let fill = Loop::new("fill_pallet", pick_one, |ctx| {
+    Box::pin(async move { ctx.get_bool("more_items").await })
+}).max_iterations(100);
 ```
 
 ### Properties
@@ -113,16 +191,25 @@ effect as compensating once.
 **Compensation ordering**: for independent actions, compensation order
 doesn't matter. For dependent actions, reverse order preserves safety.
 
-**Composition**: sequences compose. If `S₁ = [a, b]` and `S₂ = [c, d]`,
-then `S₁ >> S₂ = [a, b, c, d]` with compensation `[γ(d), γ(c), γ(b),
-γ(a)]` on full failure.
+**Composition**: all combinators (`Sequence`, `Parallel`, `Guard`,
+`Branch`, `Loop`) implement `Step`, so they nest freely:
+
+```rust
+let workflow = Sequence::new("complex")
+    .step(Parallel::new("setup")
+        .step(left_arm_sequence)
+        .step(right_arm_sequence))
+    .step(Guard::new("check", insert, condition)
+        .with_fallback(abort))
+    .step(Loop::new("fill", place_one, more_items));
+```
 
 ## Adapter Abstraction
 
 The **adapter** is a function that maps action names to physical effects:
 
 ```
-adapter : (ActionName, Args) → Result
+adapter : (ActionName, Args) → Result<Value>
 ```
 
 This decouples task logic from transport. The same sequence runs against:
@@ -130,23 +217,62 @@ This decouples task logic from transport. The same sequence runs against:
 - `LocalAdapter` → in-memory (testing)
 - `ZenohAdapter` → Zenoh pub/sub (production)
 - `ROS2Adapter` → ROS2 services (production)
-- Any custom adapter implementing the protocol
+- Any custom adapter implementing the trait
 
 **In code:**
 
-```python
-class Adapter(Protocol):
-    async def execute(self, action: str, *args, **kwargs) -> Any: ...
-    async def read(self, key: str) -> Any: ...
+```rust
+#[async_trait]
+pub trait Adapter: Send + Sync {
+    async fn execute(&self, action: &str, args: &[Value]) -> Result<Value>;
+    async fn read(&self, key: &str) -> Result<Value>;
+    async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<Value>> { ... }
+}
 ```
 
-## Future Extensions
+## Persistence and Recovery
 
-- **Atomic blocks**: group actions with a shared `on_failure` handler.
-- **Dependency-aware compensation**: compensate based on a dependency
-  DAG, not just reverse order.
-- **Persistent state**: store execution progress for crash recovery.
-- **Concurrent tasks**: execute independent tasks in parallel within a
-  sequence.
-- **Sensor-based timeouts**: timeout based on sensor readings, not just
-  wall-clock.
+A **journal** records step lifecycle events for crash recovery:
+
+```
+journal : (workflow_id, step_name, event) → ()
+```
+
+Events: `Started`, `Completed`, `Failed(reason)`, `Compensated`.
+
+On restart with the same `workflow_id`, completed steps are skipped.
+This implements the **at-most-once** execution guarantee for
+completed steps.
+
+## Resource Coordination
+
+A **resource lock** serializes access to shared physical resources
+across parallel steps:
+
+```
+locked(a, μ) = acquire(μ) → execute(a) → release(μ)
+```
+
+Where `μ` is a named mutex. Multiple steps sharing the same `μ`
+execute sequentially even within a `Parallel`.
+
+**In code:**
+
+```rust
+let zone = ResourceLock::new("pallet_zone");
+let a = Locked::new(place_left, zone.clone());
+let b = Locked::new(place_right, zone);
+```
+
+## Cancellation
+
+A **cancellation token** provides cooperative shutdown:
+
+```
+cancel : () → set(cancelled)
+check  : () → if cancelled then Error::Cancelled
+```
+
+Steps check cancellation at boundaries (between steps, between loop
+iterations). On cancellation, the current sequence compensates
+completed steps.

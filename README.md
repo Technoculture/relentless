@@ -2,306 +2,293 @@
 
 **Robots fail. Relentless tasks don't.**
 
-A lightweight Python library for composing async tasks with automatic
+A zero-dependency Rust library for composing async tasks with automatic
 compensation on failure. Built for robotics, useful anywhere actions
 need structured undo.
 
-```bash
-pip install relentless
+```toml
+[dependencies]
+relentless = "0.1"
 ```
 
-Requires Python 3.10+. No other dependencies.
+Requires Rust 2021 edition. Only runtime dependency: `tokio` + `async-trait`.
 
 ## Quick Start
 
-```python
-import relentless as rel
+```rust
+use relentless::*;
 
-@rel.task
-async def move_to(ctx, destination: str):
-    await ctx.execute("arm.move", destination)
+#[tokio::main]
+async fn main() {
+    let adapter = LocalAdapter::new();
+    let ctx = Context::new(adapter);
 
-@move_to.undo
-async def _(ctx, destination: str):
-    await ctx.execute("arm.move", "home")
+    let workflow = Sequence::new("pick_and_place")
+        .step(FnTask::new("pick", |ctx| Box::pin(async move {
+            ctx.execute("gripper.close", &[]).await?;
+            Ok(())
+        })).with_compensate(|ctx| Box::pin(async move {
+            ctx.execute("gripper.open", &[]).await?;
+            Ok(())
+        })))
+        .step(FnTask::new("place", |ctx| Box::pin(async move {
+            ctx.execute("move_to", &[Value::str("target")]).await?;
+            ctx.execute("gripper.open", &[]).await?;
+            Ok(())
+        })));
 
-@rel.task
-async def grasp(ctx):
-    await ctx.execute("gripper.close")
-
-@grasp.undo
-async def _(ctx):
-    await ctx.execute("gripper.open")
-
-@rel.task
-async def release(ctx):
-    await ctx.execute("gripper.open")
-
-# Compose into a sequence
-flow = rel.Sequence([
-    move_to("bin_a"),
-    grasp(),
-    move_to("conveyor"),
-    release(),
-])
-
-# Run it
-result = await flow.run(adapter)
+    workflow.run(&ctx).await.unwrap();
+}
 ```
 
-If `move_to("conveyor")` fails, relentless automatically compensates in
-reverse order:
+If `place` fails, relentless automatically compensates in reverse:
+1. Undo `pick` &rarr; opens gripper
 
-1. Undo `grasp` &rarr; opens gripper
-2. Undo `move_to("bin_a")` &rarr; moves arm home
-
-The failed task (`move_to("conveyor")`) is not compensated because it
-never completed.
+The failed step is not compensated because it never completed.
 
 ## Core Concepts
 
-### Tasks
+### Step Trait
 
-A task is an async function decorated with `@rel.task`. Call it with
-arguments to get a bound task ready for composition:
+Everything implements `Step`: tasks, sequences, parallels, guards, branches,
+loops. They nest freely.
 
-```python
-@rel.task(retry=3, backoff="exponential", timeout=5.0)
-async def move_to(ctx: rel.Context, destination: str):
-    await ctx.execute("arm.move", destination)
+```rust
+#[async_trait]
+pub trait Step: Send + Sync {
+    fn name(&self) -> &str;
+    async fn run(&self, ctx: &Context) -> Result<()>;
+    async fn compensate(&self, ctx: &Context) -> Result<()> { Ok(()) }
+    fn error_strategy(&self, _error: &Error) -> ErrorStrategy {
+        ErrorStrategy::Compensate
+    }
+}
 ```
 
-### Compensation
+### FnTask (closure-based steps)
 
-Register an undo function with `@task.undo`. It receives the same
-arguments as the original task:
+Build steps inline without implementing the trait:
 
-```python
-@move_to.undo
-async def _(ctx: rel.Context, destination: str):
-    await ctx.execute("arm.move", "safe_home")
-```
-
-Compensation is **declared, not inferred**. You always see exactly what
-will undo what.
-
-For safety-critical tasks, compensation can retry:
-
-```python
-@rel.task(retry=2, undo_retry=3)
-async def close_gripper(ctx):
-    await ctx.execute("gripper.close")
-
-@close_gripper.undo
-async def _(ctx):
-    # Will retry up to 3 times if undo fails (e.g. gripper stuck)
-    await ctx.execute("gripper.open")
+```rust
+let pick = FnTask::new("pick", |ctx| Box::pin(async move {
+    ctx.execute("gripper.close", &[]).await?;
+    Ok(())
+})).with_compensate(|ctx| Box::pin(async move {
+    ctx.execute("gripper.open", &[]).await?;
+    Ok(())
+}));
 ```
 
 ### Sequences
 
-A `Sequence` runs steps in order. On failure, it compensates all
-completed steps in reverse:
+Run steps in order. On failure, compensate completed steps in reverse:
 
-```python
-flow = rel.Sequence([
-    move_to("station_1"),
-    pick_up(),
-    move_to("station_2"),
-    place_down(),
-])
+```rust
+let workflow = Sequence::new("assembly")
+    .step(pick)
+    .step(move_to)
+    .step(place)
+    .retry(RetryPolicy::exponential(3, Duration::from_millis(100)))
+    .timeout(Duration::from_secs(30));
 ```
 
-Or use the `>>` operator:
-
-```python
-flow = move_to("station_1") >> pick_up() >> move_to("station_2") >> place_down()
-```
-
-Sequences nest. A sequence used inside another sequence acts as a single
-step &mdash; if the outer sequence fails later, the inner sequence
-compensates all its sub-steps:
-
-```python
-pick_phase = rel.Sequence([scan_bin(), pick_object()], name="pick")
-place_phase = rel.Sequence([move_to("drop"), release()], name="place")
-full_flow = rel.Sequence([pick_phase, place_phase])
-```
+Sequences nest. A sequence inside another sequence acts as a single step.
 
 ### Parallel
 
-Run steps concurrently. If any step fails, completed siblings are
-compensated:
+Run steps concurrently. If any fails, completed siblings are compensated:
 
-```python
-flow = rel.Sequence([
-    rel.Parallel([
-        move_arm("left", "hold_position"),
-        move_arm("right", "approach"),
-    ], name="position_arms"),
-    close_gripper("left"),
-    insert_bolt(),
-])
+```rust
+let both_arms = Parallel::new("dual_arm")
+    .step(left_arm_sequence)
+    .step(right_arm_sequence);
 ```
 
-### Branching
+### Branch
 
-Route execution based on runtime data:
+Route execution based on runtime state:
 
-```python
-flow = rel.Sequence([
-    classify_defect(),
-    rel.Branch(
-        lambda ctx: ctx.state["defect_type"],
-        {
-            "none":       route_to_packaging(),
-            "cosmetic":   route_to_rework(),
-            "structural": route_to_reject(),
-        },
-        default=stop_and_call_operator(),
-        name="route_part",
-    ),
-])
+```rust
+let sort = Branch::new("classify", |ctx| Box::pin(async move {
+    match ctx.get_str("grade").await.as_deref() {
+        Some("A") => 0,
+        Some("B") => 1,
+        _ => 2,
+    }
+}))
+.branch(route_to_premium)
+.branch(route_to_standard)
+.branch(route_to_reject);
 ```
 
-### Guards
+### Guard
 
-Run a step only if a precondition holds:
+Run a step only if a condition holds, with optional fallback:
 
-```python
-flow = rel.Sequence([
-    read_force_sensor(),
-    rel.Guard(
-        lambda ctx: ctx.state["force"] < 5.0,
-        insert_peg(),
-        otherwise=abort_insertion(),
-    ),
-])
+```rust
+let guarded = Guard::new("check_force", insert_peg, |ctx| {
+    Box::pin(async move { ctx.get_f64("force").await.unwrap_or(999.0) < 5.0 })
+})
+.with_fallback(abort_insertion);
 ```
 
-### Retry Policies
+### Loop
 
-Tasks can retry with configurable backoff:
+Repeat a step while a condition is true:
 
-```python
-@rel.task(retry=5, backoff="exponential", base_delay=0.5, jitter=True)
-async def unreliable_sensor_read(ctx):
-    data = await ctx.execute("sensor.read")
-    if data is None:
-        raise rel.TaskFailed("No reading")
-    return data
+```rust
+let fill = Loop::new("fill_pallet", pick_and_place_one, |ctx| {
+    Box::pin(async move {
+        ctx.get("items").await.and_then(|v| v.as_i64()).unwrap_or(0) < 24
+    })
+})
+.max_iterations(100);  // safety cap
 ```
 
-Backoff strategies: `"none"`, `"linear"`, `"exponential"`, `"fibonacci"`.
+### Cancellation
+
+Cooperative cancellation via `CancellationToken`:
+
+```rust
+let token = CancellationToken::new();
+let ctx = Context::new(adapter).with_cancel(token.clone());
+
+// From an e-stop handler:
+token.cancel();
+// Sequence will stop at the next step boundary and return Error::Cancelled
+```
+
+### Resource Locking
+
+Serialize access to shared physical resources:
+
+```rust
+let pallet_zone = ResourceLock::new("pallet");
+let step_a = Locked::new(place_left, pallet_zone.clone());
+let step_b = Locked::new(place_right, pallet_zone);
+// Safe to run in parallel -- mutex ensures exclusive access
+```
+
+### Journal (Crash Recovery)
+
+Record step progress for crash recovery:
+
+```rust
+let journal = MemoryJournal::new();
+let ctx = Context::new(adapter).with_journal(journal.clone());
+
+// After a crash, reuse the same workflow_id:
+// already-completed steps are skipped automatically.
+```
+
+Implement the `Journal` trait for persistent storage (database, file, etc).
+
+### Error Discrimination
+
+Per-step control over failure behavior:
+
+```rust
+impl Step for MyStep {
+    fn error_strategy(&self, error: &Error) -> ErrorStrategy {
+        match error {
+            Error::TaskFailed { message, .. } if message.contains("non-critical") => {
+                ErrorStrategy::Skip       // skip and continue
+            }
+            Error::TaskFailed { message, .. } if message.contains("fatal") => {
+                ErrorStrategy::Escalate   // stop, no compensation
+            }
+            _ => ErrorStrategy::Compensate  // default: undo completed
+        }
+    }
+    // ...
+}
+```
 
 ### Adapters
 
 Adapters bridge tasks to the outside world. Relentless is
 transport-agnostic &mdash; use whatever fits your system.
 
-**LocalAdapter** for testing (no external dependencies):
-
-```python
-from relentless.adapters import LocalAdapter
-
-adapter = LocalAdapter()
-adapter.on("arm.move", lambda dest: print(f"Moving to {dest}"))
-adapter.on("gripper.close", lambda: True)
-
-result = await flow.run(adapter)
-
-# Inspect what happened
-assert ("arm.move", ("bin_a",), {}) in adapter.calls
+```rust
+#[async_trait]
+pub trait Adapter: Send + Sync {
+    async fn execute(&self, action: &str, args: &[Value]) -> Result<Value>;
+    async fn read(&self, key: &str) -> Result<Value>;
+    async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<Value>> { ... }
+}
 ```
 
-**Custom adapters** implement two methods:
+- `LocalAdapter` for testing (in-memory, no hardware)
+- Implement `Adapter` for Zenoh, ROS 2, MQTT, gRPC, direct hardware
 
-```python
-class MyROS2Adapter:
-    async def execute(self, action: str, *args, **kwargs):
-        # Map action names to ROS2 service calls
-        ...
-
-    async def read(self, key: str):
-        # Read from ROS2 topics
-        ...
-```
-
-### Lifecycle Hooks
+### Hooks
 
 Monitor execution in production:
 
-```python
-hooks = rel.Hooks(
-    on_step_start=lambda name, ctx: print(f"Starting {name}"),
-    on_step_end=lambda name, ctx: metrics.increment(f"step.{name}.ok"),
-    on_step_error=lambda name, ctx, err: logger.error(f"{name}: {err}"),
-    on_compensate=lambda name, ctx: logger.warning(f"Compensating {name}"),
-)
+```rust
+let hooks = Hooks::new()
+    .on_step_start(|name, _ctx| println!("Starting {name}"))
+    .on_step_end(|name, _ctx| println!("Completed {name}"))
+    .on_step_error(|name, _ctx, err| eprintln!("{name} failed: {err}"))
+    .on_compensate(|name, _ctx| println!("Compensating {name}"));
 
-result = await flow.run(adapter, hooks=hooks)
+let ctx = Context::new(adapter).with_hooks(hooks);
 ```
 
 ### Shared State
 
-Tasks share a `ctx.state` dict within a sequence:
+Steps share typed state through the context:
 
-```python
-@rel.task
-async def detect_object(ctx):
-    pose = await ctx.execute("vision.detect")
-    ctx.state["target_pose"] = pose
+```rust
+// Writer step
+ctx.set("target_pose", Value::str("x=1.0,y=2.0")).await;
 
-@rel.task
-async def move_to_target(ctx):
-    pose = ctx.state["target_pose"]
-    await ctx.execute("arm.move", pose)
+// Reader step
+let pose = ctx.get_str("target_pose").await.unwrap();
 ```
 
 ## Error Handling
 
-When a task fails after exhausting retries, `SequenceFailed` is raised
-with full context:
+When a step fails, `Error::SequenceFailed` gives full context:
 
-```python
-try:
-    result = await flow.run(adapter)
-except rel.SequenceFailed as e:
-    print(f"Failed at: {e.failed_task_name}")
-    print(f"Error: {e.original_error}")
-    print(f"Compensation errors: {e.compensation_errors}")
-    print(f"All compensations succeeded: {e.compensated}")
+```rust
+match workflow.run(&ctx).await {
+    Ok(()) => println!("success"),
+    Err(Error::SequenceFailed { failed_step, source, compensation_errors }) => {
+        println!("Failed at: {failed_step}");
+        println!("Cause: {source}");
+        println!("All compensations ok: {}", compensation_errors.is_empty());
+    }
+    Err(Error::Cancelled) => println!("E-stop triggered"),
+    Err(Error::Timeout { step, seconds }) => println!("{step} timed out after {seconds}s"),
+    Err(e) => println!("Other: {e}"),
+}
 ```
 
-## Known Limitations
+## Examples
 
-Relentless is a task sequencer, not a complete robotics framework.
-These are real gaps, documented honestly:
+See `examples/` for realistic robotics scenarios:
 
-| Gap | Workaround | Status |
-|:----|:-----------|:-------|
-| No loops / iteration | Build sequences dynamically with Python `for` | By design |
-| No cancellation | `asyncio.Task.cancel()` (no compensation) | Planned |
-| No sequence-level timeout | Wrap with `asyncio.wait_for()` | Planned |
-| No persistence / crash recovery | External journal | Planned |
-| No partial success | Run items individually, collect results | Planned |
-| No resource locking | Use `asyncio.Lock` inside task bodies | External |
-| No error discrimination | Catch specific exceptions in task bodies | Planned |
-| No sensor streaming | Out of scope (use motion controllers) | By design |
-| `ctx.state` is untyped | Use descriptive keys, or dataclasses | Accepted |
+| Example | Demonstrates |
+|:--------|:-------------|
+| `pick_and_place` | Basic sequence with compensation |
+| `dual_arm` | Parallel execution, resource locking |
+| `palletizing_loop` | Loop with condition, max iterations |
+| `emergency_stop` | Cancellation token |
+| `crash_recovery` | Journal-based crash recovery |
+| `inspection_sort` | Branch routing |
 
-See `examples/` for realistic scenarios that exercise these boundaries.
+```bash
+cargo run --example pick_and_place
+cargo run --example dual_arm
+```
 
 ## Design Principles
 
-1. **Library, not framework.** You call relentless. It doesn't
-   restructure your code.
-2. **No dependencies.** Core library needs only Python 3.10+. Adapters
-   are optional.
-3. **Testable by default.** Every workflow runs with `LocalAdapter()`,
-   no hardware or network needed.
-4. **Transport-agnostic.** Zenoh, ROS2, MQTT, direct calls &mdash; plug
-   in what you use.
+1. **Library, not framework.** You call relentless. It doesn't restructure your code.
+2. **Minimal dependencies.** Only `tokio` and `async-trait`.
+3. **Testable by default.** Every workflow runs with `LocalAdapter`, no hardware needed.
+4. **Transport-agnostic.** Zenoh, ROS 2, MQTT, gRPC &mdash; plug in what you use.
 5. **Explicit over magic.** Compensation is declared, not inferred.
 
 ## License
