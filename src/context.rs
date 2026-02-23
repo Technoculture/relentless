@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -19,6 +20,8 @@ pub struct Context {
     pub cancel: CancellationToken,
     pub hooks: Hooks,
     pub journal: Option<Arc<dyn Journal>>,
+    /// When true, cancellation checks are skipped (e.g. during compensation).
+    compensating: Arc<AtomicBool>,
 }
 
 impl Context {
@@ -30,6 +33,7 @@ impl Context {
             cancel: CancellationToken::new(),
             hooks: Hooks::default(),
             journal: None,
+            compensating: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -93,11 +97,27 @@ impl Context {
     // ── cancellation ────────────────────────────────────────────────
 
     pub fn check_cancelled(&self) -> Result<()> {
+        if self.compensating.load(Ordering::SeqCst) {
+            // During compensation, cancellation checks are skipped —
+            // compensation MUST be able to run even after cancel.
+            return Ok(());
+        }
         if self.cancel.is_cancelled() {
             Err(Error::Cancelled)
         } else {
             Ok(())
         }
+    }
+
+    /// Mark context as being in compensation mode.
+    /// During compensation, `check_cancelled()` is a no-op so that
+    /// adapter calls can still run to undo completed work.
+    pub fn enter_compensation(&self) {
+        self.compensating.store(true, Ordering::SeqCst);
+    }
+
+    pub fn exit_compensation(&self) {
+        self.compensating.store(false, Ordering::SeqCst);
     }
 }
 

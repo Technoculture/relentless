@@ -52,7 +52,21 @@ impl Error {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        matches!(self, Error::Cancelled)
+        match self {
+            Error::Cancelled => true,
+            Error::SequenceFailed { source, .. } => source.is_cancelled(),
+            Error::ParallelFailed { source, .. } => source.is_cancelled(),
+            _ => false,
+        }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Error::Timeout { .. } => true,
+            Error::SequenceFailed { source, .. } => source.is_timeout(),
+            Error::ParallelFailed { source, .. } => source.is_timeout(),
+            _ => false,
+        }
     }
 
     /// True if all compensations succeeded (for SequenceFailed/ParallelFailed).

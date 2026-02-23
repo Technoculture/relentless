@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::context::Context;
 use crate::error::{Error, Result};
@@ -63,6 +65,8 @@ impl Step for Guard {
     }
 
     async fn compensate(&self, ctx: &Context) -> Result<()> {
+        // Always compensate the inner step — it ran if we got here.
+        // Do NOT re-evaluate the condition.
         self.inner.compensate(ctx).await
     }
 }
@@ -76,10 +80,13 @@ type SelectorFn = Arc<
 /// Select one of several steps to run based on a selector function.
 ///
 /// The selector returns an index into the branches vector.
+/// Only the taken branch is compensated.
 pub struct Branch {
     name: String,
     branches: Vec<Box<dyn Step>>,
     selector: SelectorFn,
+    /// Tracks which branch was taken (set during run, read during compensate).
+    taken: Mutex<Option<usize>>,
 }
 
 impl Branch {
@@ -91,6 +98,7 @@ impl Branch {
             name: name.into(),
             branches: Vec::new(),
             selector: Arc::new(selector),
+            taken: Mutex::new(None),
         }
     }
 
@@ -109,6 +117,7 @@ impl Step for Branch {
     async fn run(&self, ctx: &Context) -> Result<()> {
         let idx = (self.selector)(ctx).await;
         if idx < self.branches.len() {
+            *self.taken.lock().await = Some(idx);
             self.branches[idx].run(ctx).await
         } else {
             Err(Error::TaskFailed {
@@ -119,9 +128,11 @@ impl Step for Branch {
     }
 
     async fn compensate(&self, ctx: &Context) -> Result<()> {
-        // Compensate all branches (only the one that ran has state, others are no-ops)
-        for step in self.branches.iter().rev() {
-            step.compensate(ctx).await?;
+        // Only compensate the branch that was actually taken
+        if let Some(idx) = *self.taken.lock().await {
+            if idx < self.branches.len() {
+                self.branches[idx].compensate(ctx).await?;
+            }
         }
         Ok(())
     }
@@ -136,6 +147,8 @@ type CondFn = Arc<
 /// Repeat a step while a condition holds.
 ///
 /// Supports an optional max iteration count for safety.
+/// On compensation, the body is compensated once for each completed
+/// iteration (in reverse order).
 ///
 /// ```ignore
 /// Loop::new("pick_all_parts", pick_step, |ctx| Box::pin(async move {
@@ -148,6 +161,8 @@ pub struct Loop {
     body: Box<dyn Step>,
     condition: CondFn,
     max_iterations: Option<u32>,
+    /// Number of completed iterations (set during run, read during compensate).
+    completed_iterations: AtomicU32,
 }
 
 impl Loop {
@@ -160,6 +175,7 @@ impl Loop {
             body: Box::new(body),
             condition: Arc::new(condition),
             max_iterations: None,
+            completed_iterations: AtomicU32::new(0),
         }
     }
 
@@ -176,14 +192,34 @@ impl Step for Loop {
     }
 
     async fn run(&self, ctx: &Context) -> Result<()> {
+        self.completed_iterations.store(0, Ordering::SeqCst);
         let mut count = 0u32;
 
         while (self.condition)(ctx).await {
             ctx.check_cancelled()?;
 
-            self.body.run(ctx).await?;
+            match self.body.run(ctx).await {
+                Ok(()) => {
+                    count += 1;
+                    self.completed_iterations.store(count, Ordering::SeqCst);
+                }
+                Err(e) => {
+                    // Body failed — compensate all completed iterations
+                    // before propagating the error (saga pattern).
+                    ctx.enter_compensation();
+                    let mut comp_errs = Vec::new();
+                    for _ in (0..count).rev() {
+                        if let Err(ce) = self.body.compensate(ctx).await {
+                            comp_errs.push(ce);
+                        }
+                    }
+                    ctx.exit_compensation();
+                    // Reset counter since we've already compensated
+                    self.completed_iterations.store(0, Ordering::SeqCst);
+                    return Err(e);
+                }
+            }
 
-            count += 1;
             if let Some(max) = self.max_iterations {
                 if count >= max {
                     break;
@@ -195,7 +231,12 @@ impl Step for Loop {
     }
 
     async fn compensate(&self, ctx: &Context) -> Result<()> {
-        self.body.compensate(ctx).await
+        // Compensate once for each completed iteration, in reverse.
+        let n = self.completed_iterations.load(Ordering::SeqCst);
+        for _ in (0..n).rev() {
+            self.body.compensate(ctx).await?;
+        }
+        Ok(())
     }
 
     fn error_strategy(&self, error: &Error) -> ErrorStrategy {

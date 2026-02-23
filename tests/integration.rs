@@ -111,7 +111,7 @@ async fn sequence_timeout() {
         .timeout(Duration::from_millis(50));
 
     let err = seq.run(&c).await.unwrap_err();
-    assert!(matches!(err, Error::Timeout { .. }));
+    assert!(err.is_timeout(), "Expected timeout, got: {err}");
 }
 
 #[tokio::test]

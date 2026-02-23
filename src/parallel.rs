@@ -1,13 +1,16 @@
 use async_trait::async_trait;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::step::{ErrorStrategy, Step};
 
-/// Execute steps concurrently; if any fails, compensate all that succeeded.
+/// Execute steps concurrently; if any fails, signal cancellation to
+/// siblings and compensate all that succeeded.
 ///
 /// All steps share the same `Context`, which is safe because it uses
 /// interior mutability (`Arc<RwLock<…>>`).
@@ -30,10 +33,12 @@ impl Parallel {
     }
 }
 
-/// Poll all futures concurrently, completing when every one is ready.
+/// Poll all futures concurrently. When the first error is seen,
+/// set a flag so the wrapping futures can bail out quickly.
 struct JoinAll<'a> {
     futs: Vec<Option<Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>>>,
     results: Vec<Option<Result<()>>>,
+    failed: Arc<AtomicBool>,
 }
 
 impl<'a> Future for JoinAll<'a> {
@@ -46,9 +51,11 @@ impl<'a> Future for JoinAll<'a> {
 
         for i in 0..this.futs.len() {
             if let Some(fut) = &mut this.futs[i] {
-                // The future is inside a Pin<Box<…>>; .as_mut() yields Pin<&mut …>.
                 match fut.as_mut().poll(cx) {
                     Poll::Ready(result) => {
+                        if result.is_err() {
+                            this.failed.store(true, Ordering::SeqCst);
+                        }
                         this.results[i] = Some(result);
                         this.futs[i] = None;
                     }
@@ -79,16 +86,33 @@ impl Step for Parallel {
             return Ok(());
         }
 
+        // Shared flag: set to true when any step fails, so siblings can bail.
+        let failed = Arc::new(AtomicBool::new(false));
+
         let futs: Vec<_> = self
             .steps
             .iter()
-            .map(|s| Some(Box::pin(s.run(ctx)) as Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>))
+            .map(|s| {
+                let f = failed.clone();
+                Some(Box::pin(async move {
+                    // Check if a sibling already failed before we start heavy work
+                    if f.load(Ordering::SeqCst) {
+                        return Err(Error::Cancelled);
+                    }
+                    let result = s.run(ctx).await;
+                    if result.is_err() {
+                        f.store(true, Ordering::SeqCst);
+                    }
+                    result
+                }) as Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>)
+            })
             .collect();
 
         let results: Vec<Option<Result<()>>> = (0..futs.len()).map(|_| None).collect();
         let all_results = JoinAll {
             results,
             futs,
+            failed,
         }
         .await;
 
@@ -100,7 +124,11 @@ impl Step for Parallel {
             match result {
                 Ok(()) => succeeded.push(i),
                 Err(e) => {
-                    if first_error.is_none() {
+                    // Skip cancellation errors from siblings — find the real error
+                    if first_error.is_none() && !e.is_cancelled() {
+                        first_error = Some((self.steps[i].name().to_string(), e));
+                    } else if first_error.is_none() {
+                        // If all errors are cancellations, use the first one
                         first_error = Some((self.steps[i].name().to_string(), e));
                     }
                 }
