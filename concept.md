@@ -1,106 +1,278 @@
-# Type Level Concept
-## 1. Basic Elements
-*   **States (S):** The set of all possible states of the system. A state `s ∈ S` represents a snapshot of the robot and its environment at a given point in time. This could include:
-    *   Robot joint angles
-    *   Sensor readings (force, vision, etc.)
-    *   Object positions and properties
-    *   Environment map
-    *   System health status
-    *   Any other relevant data
-    We can define subsets of `S` to represent specific conditions:
-    *   `S_safe`: Set of safe states
-    *   `S_error`: Set of error states
-*   **Actions (A):** The set of all possible actions the robot can perform. An action `a ∈ A` represents a command or operation that changes the system's state. Examples:
-    *   `move_joint(joint_id, angle)`
-    *   `grasp(object_id)`
-    *   `weld(part_id, parameters)`
-    *   `navigate(x, y, theta)`
-*   **Observations (O):** The set of all possible observations the robot can make. An observation `o ∈ O` is the data received from sensors.
-*   **Time (T):** We'll assume a discrete timeline `T = {0, 1, 2, ...}` for simplicity.
+# Design: Compensation Algebra for Task Sequences
 
-## 2. State Transitions
-*   **Transition Function (τ):**  `τ: S × A → S`
-    *   `τ(s, a) = s'` represents the state transition from state `s` to state `s'` when action `a` is executed.
-    *   This function is deterministic in our simplified model. In reality, it could be stochastic due to noise and uncertainty.
-*   **Observation Function (ω):** `ω: S → O`
-    *   `ω(s) = o` represents the observation `o` obtained in state `s`.
+This document formalizes the compensation model behind Relentless and
+maps each mathematical concept to its Rust implementation.
 
-## 3. Workflows as Sequences of Actions
-*   **Workflow (W):** A workflow can be represented as a finite sequence of actions:
-    *   `W = <a_1, a_2, ..., a_n>`, where `a_i ∈ A`
-*   **Workflow Execution:** Given an initial state `s_0`, the execution of a workflow `W` generates a state trajectory:
-    *   `s_1 = τ(s_0, a_1)`
-    *   `s_2 = τ(s_1, a_2)`
-    *   ...
-    *   `s_n = τ(s_{n-1}, a_n)`
+## The Problem
 
-## 4. Compensation
-*   **Compensation Function (γ):** `γ: A → A`
-    *   `γ(a) = a'` defines the compensation action `a'` for action `a`.
-    *   For reversible actions, `γ(a)` is ideally the inverse: `τ(τ(s, a), γ(a)) ≈ s`
-    *   For irreversible actions, `γ(a)` represents a mitigation or alternative action.
-*   **Compensation Sequence:** For a workflow `W = <a_1, a_2, ..., a_n>`, a simple reverse-order compensation sequence is `C(W) = <γ(a_n), γ(a_{n-1}), ..., γ(a_1)>`.
+Robotic actions are often **irreversible** or have **physical side
+effects**. When a multi-step operation fails midway, you can't roll back
+a database transaction -- you need to physically undo what was done
+(open the gripper, move the arm home, release the part).
 
-## 5. Handling Failures and Errors
-*   **Error State:** A state `s ∈ S_error` indicates an error condition.
-*   **Failure Detection:** A function `δ: S → {True, False}` where `δ(s) = True` if `s ∈ S_error`, and `False` otherwise.
-*   **Compensation Trigger:** If `δ(s_i) = True` during workflow execution, trigger the compensation sequence.
+The question: **how do you systematically undo a partial sequence of
+physical actions?**
 
-## 6. Grouping and Transactions
-*   **Grouped Actions:** A subset of actions `G ⊆ A` can be treated as a group or transaction.
-*   **Group Compensation Function (Γ):** `Γ: 2^A → W`
-    *   `Γ(G) = C` defines a compensation workflow `C` for the group `G`.
-    *   `2^A` denotes the power set of `A` (the set of all subsets of `A`).
-*   **Atomic Execution:** A group `G` is executed atomically, meaning either all actions in `G` succeed, or the compensation `Γ(G)` is executed.
+## The Model
 
-## 7. Types and Type System
-*   **State Types:** We can define types for different parts of the state space:
-    *   `JointAngles: [float]` (list of floats)
-    *   `Position: (float, float, float)` (3D coordinates)
-    *   `Force: float`
-    *   `Image: ...` (complex image type)
-*   **Action Types:** Actions can also have types based on their inputs and effects:
-    *   `move_joint: JointID × Angle → Result`
-    *   `grasp: ObjectID → Success | Failure`
-    *   `weld: PartID × WeldParams → Success | Failure`
-*   **Type Checking:** A type system can ensure that:
-    *   Actions are applied to states of the correct type.
-    *   Compensation actions are compatible with the actions they are compensating.
-    *   Workflows are well-formed (e.g., actions are applied in a valid sequence).
+### Actions and Compensation
 
-## 8. Formalizing Compensation Strategies
-*   **Reverse Order:**
-    *   `C_reverse(<a_1, a_2, ..., a_n>) = <γ(a_n), γ(a_{n-1}), ..., γ(a_1)>`
-*   **Dependency-Aware:**
-    *   Requires a dependency relation `D ⊆ A × A` where `(a, b) ∈ D` means action `b` depends on the successful execution of action `a`.
-    *   `C_dependency(W, a_failed)` would involve finding the transitive closure of dependencies on `a_failed` and executing compensations for those actions in reverse topological order.
-*   **Constraint-Based:**
-    *   Requires a set of constraints `K` that must hold after compensation.
-    *   `C_constraint(s, K)` would involve finding a sequence of actions that transforms state `s` into a state `s'` where all constraints in `K` are satisfied.
+An **action** `a` is an async operation that changes the physical world:
 
-## 9. Algebraic Properties
-*   **Idempotency of Compensation (Ideal):** `τ(τ(s, a), γ(a)) ≈ s` (for reversible actions)
-*   **Associativity of Compensation (Ideal):** `γ(a_1 . a_2) ≈ γ(a_2) . γ(a_1)` (where `.` denotes action composition)
-*   **Commutativity of Independent Actions:** If actions `a` and `b` are independent, then `τ(τ(s, a), b) = τ(τ(s, b), a)`
+```
+a : Context → Result<()>
+```
 
-## 10. Example: Bin Picking
-*   **States:** `S = {RobotPose, BinContents, GripperState, ...}`
-*   **Actions:**
-    *   `move_to(pose: Pose) : RobotPose → Result`
-    *   `grasp(force: Force) : GripperState → Success | Failure`
-    *   `release() : GripperState → Success`
-*   **Compensation:**
-    *   `γ(move_to(p)) = move_to(safe_pose)`
-    *   `γ(grasp(f)) = release()`
-*   **Workflow:** `W = <move_to(bin_pose), grasp(10N), move_to(conveyor_pose), release()>`
-*   **Failure:** If `grasp` fails (e.g., `δ(s) = True` where `s` is the state after `grasp`), trigger `C(W) = <release(), move_to(safe_pose)>`
+A **compensation** `γ(a)` is an action that mitigates or reverses `a`:
 
-## 11. Challenges and Extensions
-*   **Stochasticity:** Extend the model to handle probabilistic state transitions and noisy observations.
-*   **Partial Observability:** Deal with cases where the state is not fully observable.
-*   **Continuous Time:** Move from a discrete-time model to a continuous-time model.
-*   **Concurrency:** Handle concurrent execution of workflows and actions.
-*   **Planning:** Integrate planning algorithms to generate workflows and compensation strategies automatically.
-*   **Learning:** Use machine learning to learn state transition models, compensation functions, or even entire workflows from data.
+```
+γ : Action → Action
+```
 
-This mathematical framework provides a solid foundation for reasoning about robotic workflows, their execution, and their behavior under failures. By formalizing these concepts, we can develop more robust and reliable systems, analyze their properties, and potentially automate the generation of workflows and compensation strategies. This is a starting point, and further refinement would involve addressing the challenges and extensions mentioned above to create a truly comprehensive and powerful algebra for robotic workflows.
+For reversible actions: `execute(γ(a)) after execute(a) ≈ no-op`
+For irreversible actions: `γ(a)` is the best available mitigation.
+
+**In code:**
+
+```rust
+let grasp = FnTask::new("grasp", |ctx| Box::pin(async move {
+    ctx.execute("gripper.close", &[]).await?;
+    Ok(())
+})).with_compensate(|ctx| Box::pin(async move {
+    ctx.execute("gripper.open", &[]).await?;
+    Ok(())
+}));
+```
+
+### Sequences and the Saga Pattern
+
+A **sequence** is an ordered list of actions:
+
+```
+S = [a₁, a₂, ..., aₙ]
+```
+
+Execution produces a trajectory of states:
+
+```
+s₀ →(a₁)→ s₁ →(a₂)→ s₂ → ... →(aₙ)→ sₙ
+```
+
+If action `aₖ` fails after `a₁...aₖ₋₁` succeeded, the **compensation
+sequence** is:
+
+```
+C(S, k) = [γ(aₖ₋₁), γ(aₖ₋₂), ..., γ(a₁)]
+```
+
+We compensate completed actions in reverse order. The failed action is
+excluded because it never completed.
+
+**In code:**
+
+```rust
+let flow = Sequence::new("assembly")
+    .step(a1).step(a2).step(a3).step(a4);
+// If a3 fails: compensate a2, then a1
+```
+
+### Retry as Bounded Repetition
+
+A **retry policy** `R(a, n, d)` executes action `a` up to `n` times
+with delay function `d(attempt)`:
+
+```
+R(a, n, d) = a | delay(d(1)) → a | delay(d(2)) → a | ... | FAIL
+```
+
+Where `|` means "if failed, then". Delay strategies:
+
+- **None**: `d(i) = 0`
+- **Linear**: `d(i) = base × i`
+- **Exponential**: `d(i) = base × 2^(i-1)`
+- **Fibonacci**: `d(i) = base × fib(i)`
+
+With optional jitter: `d'(i) = d(i) × uniform(0.5, 1.5)`
+
+**In code:**
+
+```rust
+let seq = Sequence::new("retrying")
+    .step(flaky_step)
+    .retry(RetryPolicy::exponential(5, Duration::from_millis(100)).with_jitter());
+```
+
+### Error Discrimination
+
+Not all failures require the same response. The **error strategy**
+function maps errors to behaviors:
+
+```
+σ : Error → {Compensate, Skip, Escalate}
+```
+
+- **Compensate**: undo completed steps in reverse (default)
+- **Skip**: ignore this failure, continue to next step
+- **Escalate**: stop immediately, do NOT compensate
+
+**In code:**
+
+```rust
+fn error_strategy(&self, error: &Error) -> ErrorStrategy {
+    match error {
+        Error::TaskFailed { message, .. } if message.contains("non-critical") => {
+            ErrorStrategy::Skip
+        }
+        _ => ErrorStrategy::Compensate,
+    }
+}
+```
+
+### Parallel Composition
+
+Actions `a₁, a₂, ..., aₙ` execute concurrently:
+
+```
+P(a₁, ..., aₙ) : all aᵢ run simultaneously
+```
+
+If any `aᵢ` fails, all completed siblings `aⱼ` (j ≠ i, succeeded) are
+compensated.
+
+**In code:**
+
+```rust
+let par = Parallel::new("both_arms")
+    .step(left_arm).step(right_arm);
+```
+
+### Conditional Execution
+
+A **guard** `G(p, a, f)` checks predicate `p`, runs action `a` if true,
+fallback `f` if false:
+
+```
+G(p, a, f) = if p(ctx) then a else f
+```
+
+A **branch** `B(s, [a₁, ..., aₙ])` selects one action based on
+selector `s`:
+
+```
+B(s, branches) = branches[s(ctx)]
+```
+
+### Iteration
+
+A **loop** `L(p, a, n)` repeats action `a` while predicate `p` holds,
+bounded by maximum iterations `n`:
+
+```
+L(p, a, n) = while p(ctx) ∧ count < n: execute(a)
+```
+
+**In code:**
+
+```rust
+let fill = Loop::new("fill_pallet", pick_one, |ctx| {
+    Box::pin(async move { ctx.get_bool("more_items").await })
+}).max_iterations(100);
+```
+
+### Properties
+
+**Compensation idempotency** (ideal): compensating twice has the same
+effect as compensating once.
+
+```
+γ(a) ∘ γ(a) ≈ γ(a)
+```
+
+**Compensation ordering**: for independent actions, compensation order
+doesn't matter. For dependent actions, reverse order preserves safety.
+
+**Composition**: all combinators (`Sequence`, `Parallel`, `Guard`,
+`Branch`, `Loop`) implement `Step`, so they nest freely:
+
+```rust
+let workflow = Sequence::new("complex")
+    .step(Parallel::new("setup")
+        .step(left_arm_sequence)
+        .step(right_arm_sequence))
+    .step(Guard::new("check", insert, condition)
+        .with_fallback(abort))
+    .step(Loop::new("fill", place_one, more_items));
+```
+
+## Adapter Abstraction
+
+The **adapter** is a function that maps action names to physical effects:
+
+```
+adapter : (ActionName, Args) → Result<Value>
+```
+
+This decouples task logic from transport. The same sequence runs against:
+
+- `LocalAdapter` → in-memory (testing)
+- `ZenohAdapter` → Zenoh pub/sub (production)
+- `ROS2Adapter` → ROS2 services (production)
+- Any custom adapter implementing the trait
+
+**In code:**
+
+```rust
+#[async_trait]
+pub trait Adapter: Send + Sync {
+    async fn execute(&self, action: &str, args: &[Value]) -> Result<Value>;
+    async fn read(&self, key: &str) -> Result<Value>;
+    async fn subscribe(&self, topic: &str) -> Result<mpsc::Receiver<Value>> { ... }
+}
+```
+
+## Persistence and Recovery
+
+A **journal** records step lifecycle events for crash recovery:
+
+```
+journal : (workflow_id, step_name, event) → ()
+```
+
+Events: `Started`, `Completed`, `Failed(reason)`, `Compensated`.
+
+On restart with the same `workflow_id`, completed steps are skipped.
+This implements the **at-most-once** execution guarantee for
+completed steps.
+
+## Resource Coordination
+
+A **resource lock** serializes access to shared physical resources
+across parallel steps:
+
+```
+locked(a, μ) = acquire(μ) → execute(a) → release(μ)
+```
+
+Where `μ` is a named mutex. Multiple steps sharing the same `μ`
+execute sequentially even within a `Parallel`.
+
+**In code:**
+
+```rust
+let zone = ResourceLock::new("pallet_zone");
+let a = Locked::new(place_left, zone.clone());
+let b = Locked::new(place_right, zone);
+```
+
+## Cancellation
+
+A **cancellation token** provides cooperative shutdown:
+
+```
+cancel : () → set(cancelled)
+check  : () → if cancelled then Error::Cancelled
+```
+
+Steps check cancellation at boundaries (between steps, between loop
+iterations). On cancellation, the current sequence compensates
+completed steps.
